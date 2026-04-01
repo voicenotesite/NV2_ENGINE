@@ -1,6 +1,10 @@
 use noise::{NoiseFn, Perlin};
 use super::block::BlockType;
 
+/// Sea-level height used for lake generation. Any terrain surface strictly
+/// below this value (in eligible biomes) is flooded with standing water.
+pub const WATER_LEVEL: u32 = 46;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Biome {
     Plains,
@@ -332,10 +336,39 @@ impl BiomeGenerator {
             }
         }
 
+        // Lake generation: fill terrain below sea level with standing water.
+        // Applies to biomes that naturally have water bodies (not deserts, mountains, snow, beach).
+        const WATER_LEVEL: usize = 46;
+        if surface < WATER_LEVEL && !matches!(biome, Biome::Desert | Biome::Mountains | Biome::Snowy | Biome::Beach | Biome::River) {
+            for y in (surface + 1)..=WATER_LEVEL {
+                if y < 256 {
+                    column[y] = BlockType::Water;
+                }
+            }
+        }
+
         // Place trees in forests (avoid glades and river tiles)
         if matches!(biome, Biome::ForestDense | Biome::ForestSparse) && self.should_place_tree(wx, wz, biome) && surface > 0 && surface < 250 {
             self.place_tree(wx, surface as i32, wz, column);
         }
+    }
+
+    /// Returns `true` when the surface block the generator would place at (wx, wz)
+    /// is a liquid (water). Used by `World::find_safe_spawn` without needing any
+    /// chunk to be loaded.
+    pub fn surface_is_liquid(&self, wx: i32, wz: i32) -> bool {
+        let biome = self.get_biome(wx, wz);
+        if matches!(biome, Biome::River) {
+            return true;
+        }
+        // Lake generation mirrors fill_column: terrain below WATER_LEVEL in
+        // non-desert / non-mountain / non-snowy / non-beach biomes is flooded.
+        let h = self.surface_height(wx, wz);
+        h < WATER_LEVEL
+            && !matches!(
+                biome,
+                Biome::Desert | Biome::Mountains | Biome::Snowy | Biome::Beach | Biome::River
+            )
     }
 
     /// Ambient color and multiplier for lighting at given world position

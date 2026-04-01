@@ -6,6 +6,7 @@ pub mod raycast;
 pub mod palette;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -186,64 +187,154 @@ impl World {
         self.generator.surface_height(wx, wz)
     }
 
-    /// Simple water simulation step. This performs a single-pass cellular update
-    /// on loaded chunks: water flows down if possible, otherwise attempts to
-    /// move laterally into adjacent air cells.
+    /// Find a safe spawn position on land, spiralling outward from (0, 0) until a
+    /// non-liquid surface is found.  Uses the biome generator directly so that no
+    /// chunks need to be loaded at the time of the call.
     ///
-    /// Source blocks (water_meta bit 3 = 0x08) represent permanent water sources
-    /// (naturally generated rivers, lakes). They spread to neighbours but are never
-    /// consumed: the source voxel stays, only a copy flows into the empty space.
-    /// Flow blocks (bit 3 = 0) are consumed when they move.
-    pub fn simulate_water(&mut self) {
-        let mut changes: Vec<(i32, i32, i32, BlockType)> = Vec::new();
-        let mut meta_changes: Vec<(i32, i32, i32, u8)> = Vec::new();
+    /// Returns `(x, y, z)` world coordinates where y already accounts for eye-height.
+    pub fn find_safe_spawn(&self) -> (f32, f32, f32) {
+        // Quick path: (0, 0) is already solid land
+        if !self.generator.surface_is_liquid(0, 0) {
+            let h = self.generator.surface_height(0, 0) as f32;
+            return (0.5, h + 1.8, 0.5);
+        }
 
-        // Snapshot keys to avoid borrowing self.chunks while mutating
+        // Spiral outward in rings until we find a dry tile
+        for radius in 1i32..=256 {
+            for dz in -radius..=radius {
+                for dx in -radius..=radius {
+                    // Only visit the outermost ring of this radius
+                    if dx.abs() != radius && dz.abs() != radius {
+                        continue;
+                    }
+                    if !self.generator.surface_is_liquid(dx, dz) {
+                        let h = self.generator.surface_height(dx, dz) as f32;
+                        return (dx as f32 + 0.5, h + 1.8, dz as f32 + 0.5);
+                    }
+                }
+            }
+        }
+
+        // Absolute fallback: place well above any water
+        let h = self.generator.surface_height(0, 0) as f32;
+        (0.5, h.max(biomes::WATER_LEVEL as f32) + 1.8, 0.5)
+    }
+
+    /// Level-based water/liquid simulation.  Every water block is a liquid body
+    /// with a level stored in bits 0-2 of its metadata (1 = furthest extent,
+    /// 7 = adjacent to source or one step below).  Bit 3 marks a permanent
+    /// source block that never drains.
+    ///
+    /// Flow rules (Minecraft-style):
+    ///  - Downward:   always creates a full-level (7) flow block in the cell below.
+    ///  - Lateral:    a source spreads at level 6; a flow block at level N spreads
+    ///                at level N-1.  Spreading stops when level would reach 0.
+    ///  - A lateral neighbour is updated only when our new level is strictly greater
+    ///    than the neighbour's current level (no infinite-loop oscillation).
+    ///
+    /// Returns the set of chunk coordinates whose block data changed so that only
+    /// those water meshes need to be rebuilt.
+    pub fn simulate_water(&mut self) -> Vec<(i32, i32)> {
+        let mut changes:      Vec<(i32, i32, i32, BlockType)> = Vec::new();
+        let mut meta_changes: Vec<(i32, i32, i32, u8)>        = Vec::new();
+        let mut dirty: HashSet<(i32, i32)>                    = HashSet::new();
+
+        // Collect chunk keys upfront to avoid holding a borrow on self.chunks
         let chunk_keys: Vec<(i32, i32)> = self.chunks.keys().cloned().collect();
 
         for (cx, cz) in chunk_keys {
-            if let Some(chunk) = self.chunks.get(&(cx, cz)) {
-                for x in 0..CHUNK_W {
-                    for z in 0..CHUNK_D {
-                        for y in 0..crate::world::chunk::CHUNK_H {
-                            let bt = *chunk.get(x, y, z);
-                            if bt != BlockType::Water { continue; }
+            let chunk = match self.chunks.get(&(cx, cz)) {
+                Some(c) => c,
+                None    => continue,
+            };
 
-                            let wx = cx * CHUNK_W as i32 + x as i32;
-                            let wy = y as i32;
-                            let wz = cz * CHUNK_D as i32 + z as i32;
+            // Fast-skip chunks that contain no water blocks at all
+            let has_water = chunk.blocks.iter()
+                .flat_map(|yz| yz.iter())
+                .flat_map(|z| z.iter())
+                .any(|&b| b == BlockType::Water);
+            if !has_water { continue; }
 
-                            let meta = self.get_water_meta(wx, wy, wz);
-                            let is_source = (meta & 0x08) != 0;
+            for x in 0..CHUNK_W {
+                for z in 0..CHUNK_D {
+                    for y in 0..crate::world::chunk::CHUNK_H {
+                        if *chunk.get(x, y, z) != BlockType::Water { continue; }
 
-                            // Try to flow down
-                            if wy > 0 && self.get_block(wx, wy - 1, wz) == BlockType::Air {
-                                changes.push((wx, wy - 1, wz, BlockType::Water));
-                                meta_changes.push((wx, wy - 1, wz, 0x07)); // full flow block
-                                if !is_source {
-                                    // Flow blocks are consumed; source blocks stay
-                                    changes.push((wx, wy, wz, BlockType::Air));
-                                    meta_changes.push((wx, wy, wz, 0x00));
+                        let wx = cx * CHUNK_W as i32 + x as i32;
+                        let wy = y as i32;
+                        let wz = cz * CHUNK_D as i32 + z as i32;
+
+                        let meta      = self.get_water_meta(wx, wy, wz);
+                        let is_source = (meta & 0x08) != 0;
+                        let level     = meta & 0x07;
+
+                        // ── Downward flow ─────────────────────────────────────────
+                        if wy > 0 {
+                            match self.get_block(wx, wy - 1, wz) {
+                                BlockType::Air => {
+                                    changes.push((wx, wy - 1, wz, BlockType::Water));
+                                    meta_changes.push((wx, wy - 1, wz, 0x07)); // full level
+                                    dirty.insert(((wx).div_euclid(CHUNK_W as i32), (wz).div_euclid(CHUNK_D as i32)));
+                                    if !is_source {
+                                        changes.push((wx, wy, wz, BlockType::Air));
+                                        meta_changes.push((wx, wy, wz, 0x00));
+                                        dirty.insert((cx, cz));
+                                    }
+                                    continue; // downward takes priority over lateral
                                 }
-                                continue;
+                                BlockType::Water => {
+                                    // Equalise level below if we can raise it
+                                    let below_meta = self.get_water_meta(wx, wy - 1, wz);
+                                    if (below_meta & 0x08) == 0 && (below_meta & 0x07) < 7 {
+                                        meta_changes.push((wx, wy - 1, wz, 0x07));
+                                        dirty.insert(((wx).div_euclid(CHUNK_W as i32), (wz).div_euclid(CHUNK_D as i32)));
+                                    }
+                                }
+                                _ => {}
                             }
+                        }
 
-                            // Try to flow sideways into air cells (cardinal directions)
-                            let dirs = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)];
-                            for (dx, dz) in dirs.iter() {
-                                let nx = wx + dx;
-                                let nz = wz + dz;
-                                if self.get_block(nx, wy, nz) == BlockType::Air {
-                                    if self.get_block(nx, wy - 1, nz) != BlockType::Air || wy == 0 {
+                        // ── Lateral spread ───────────────────────────────────────
+                        // A source block spawns level-6 neighbours; a flow block
+                        // spawns level (level-1) neighbours; stops at 0.
+                        let spread_level: u8 = if is_source { 6 } else { level.saturating_sub(1) };
+                        if spread_level == 0 { continue; }
+
+                        for (dx, dz) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                            let nx = wx + dx;
+                            let nz = wz + dz;
+                            let ncx = nx.div_euclid(CHUNK_W as i32);
+                            let ncz = nz.div_euclid(CHUNK_D as i32);
+
+                            match self.get_block(nx, wy, nz) {
+                                BlockType::Air => {
+                                    // Require a solid or water floor so water doesn't
+                                    // slide horizontally off unsupported cliffs
+                                    let floor = if wy > 0 { self.get_block(nx, wy - 1, nz) } else { BlockType::Bedrock };
+                                    if floor != BlockType::Air {
                                         changes.push((nx, wy, nz, BlockType::Water));
-                                        meta_changes.push((nx, wy, nz, 0x07));
+                                        meta_changes.push((nx, wy, nz, spread_level));
+                                        dirty.insert((ncx, ncz));
+                                        // Only consume a flow block (not a source) on lateral spread
                                         if !is_source {
                                             changes.push((wx, wy, wz, BlockType::Air));
                                             meta_changes.push((wx, wy, wz, 0x00));
+                                            dirty.insert((cx, cz));
+                                            break; // one direction per tick for flow blocks
                                         }
-                                        break;
                                     }
                                 }
+                                BlockType::Water => {
+                                    // Update neighbour's level only if ours is strictly higher
+                                    let n_meta = self.get_water_meta(nx, wy, nz);
+                                    let n_src  = (n_meta & 0x08) != 0;
+                                    let n_lvl  = n_meta & 0x07;
+                                    if !n_src && n_lvl < spread_level {
+                                        meta_changes.push((nx, wy, nz, spread_level));
+                                        dirty.insert((ncx, ncz));
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -258,6 +349,8 @@ impl World {
         for (wx, wy, wz, meta) in meta_changes {
             self.set_water_meta(wx, wy, wz, meta);
         }
+
+        dirty.into_iter().collect()
     }
 
     /// Get per-voxel water metadata (0 if none)

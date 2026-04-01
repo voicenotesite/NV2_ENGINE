@@ -39,7 +39,7 @@ impl ChunkMesh {
         let mut vertices = Vec::new();
         let mut indices  = Vec::new();
 
-        let chunk = match world.get_chunk(cx, cz) {
+        let chunk: &crate::world::chunk::Chunk = match world.get_chunk(cx, cz) {
             Some(c) => c,
             None    => return Self { vertices, indices },
         };
@@ -56,7 +56,6 @@ impl ChunkMesh {
 
         for x in 0..CHUNK_W {
             for z in 0..CHUNK_D {
-
                 for y in 0..CHUNK_H {
                     let block = chunk.get(x, y, z);
                     if !block.is_opaque() { continue; }
@@ -113,7 +112,7 @@ impl ChunkMesh {
         let mut vertices = Vec::new();
         let mut indices  = Vec::new();
 
-        let chunk = match world.get_chunk(cx, cz) {
+        let chunk: &crate::world::chunk::Chunk = match world.get_chunk(cx, cz) {
             Some(c) => c,
             None    => return Self { vertices, indices },
         };
@@ -128,7 +127,6 @@ impl ChunkMesh {
 
         for x in 0..CHUNK_W {
             for z in 0..CHUNK_D {
-
                 for y in 0..CHUNK_H {
                     let block = chunk.get(x, y, z);
                     if *block != BlockType::Water { continue; }

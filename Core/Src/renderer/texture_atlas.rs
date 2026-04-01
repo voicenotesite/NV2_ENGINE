@@ -258,16 +258,23 @@ impl AtlasTexture {
             }
             
             if !loaded {
-                eprintln!("⚠️ Could not load texture for block: {}", name);
-                // Fill with placeholder color (checkerboard pattern)
-                for y in 0..16 {
-                    for x in 0..16 {
-                        let pattern = ((x / 2 + y / 2) % 2) * 128;
-                        atlas.put_pixel(
-                            (col * 16 + x) as u32, 
-                            (row * 16 + y) as u32, 
-                            image::Rgba([128 + pattern as u8, 64, 128 + pattern as u8, 255])
-                        );
+                // Water tiles: generate procedurally rather than showing a checkerboard
+                let is_water_tile = matches!(name, &"water_still" | &"water_flow");
+                if is_water_tile {
+                    fill_water_tile(&mut atlas, *col as u32, *row as u32);
+                    placed += 1;
+                } else {
+                    eprintln!("⚠️ Could not load texture for block: {}", name);
+                    // Fill with placeholder color (checkerboard pattern)
+                    for y in 0..16 {
+                        for x in 0..16 {
+                            let pattern = ((x / 2 + y / 2) % 2) * 128;
+                            atlas.put_pixel(
+                                (col * 16 + x) as u32,
+                                (row * 16 + y) as u32,
+                                image::Rgba([128 + pattern as u8, 64, 128 + pattern as u8, 255])
+                            );
+                        }
                     }
                 }
             }
@@ -281,6 +288,57 @@ impl AtlasTexture {
 const ATLAS_W: f32 = 512.0;  // Updated: 32 columns x 16px = 512px
 const ATLAS_H: f32 = 320.0;  // Updated: 20 rows x 16px = 320px (we use ~5 rows)
 const TILE:    f32 = 16.0;
+
+/// Generate a 16×16 procedural water tile using sine-wave interference.
+///
+/// Three overlapping waves at different frequencies / directions produce a
+/// convincing still-water ripple pattern purely through arithmetic — no
+/// external texture file required.  The palette blends from deep ocean blue
+/// to a bright cyan crest.
+pub fn generate_water_tile_rgba() -> Vec<u8> {
+    use std::f32::consts::PI;
+    let mut pixels = Vec::with_capacity(16 * 16 * 4);
+    for y in 0u32..16 {
+        for x in 0u32..16 {
+            let u = x as f32 / 16.0; // 0..1
+            let v = y as f32 / 16.0; // 0..1
+
+            // Three waves: horizontal, diagonal, radial
+            let w1 = (u * PI * 5.0  + v * PI * 2.5).sin();
+            let w2 = (u * PI * 2.0  - v * PI * 4.0).sin();
+            let w3 = {
+                let du = u - 0.5;
+                let dv = v - 0.5;
+                (du * du + dv * dv).sqrt() * PI * 12.0
+            }.sin();
+
+            // Weighted mix → normalised to [0, 1]
+            let t = ((w1 * 0.45 + w2 * 0.35 + w3 * 0.20) + 1.0) * 0.5;
+            let t = t.clamp(0.0, 1.0);
+
+            // Deep blue (#0A3C60) → medium blue (#1878AA) → bright cyan (#50C8E8)
+            let r = (10.0  + t * t * 70.0)  as u8;
+            let g = (60.0  + t * 110.0)     as u8;
+            let b = (96.0  + t * 96.0)      as u8;
+
+            pixels.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    pixels
+}
+
+/// Paint a procedurally-generated water tile into `atlas` at atlas grid
+/// position (col, row) (each cell is 16×16 px).
+fn fill_water_tile(atlas: &mut RgbaImage, col: u32, row: u32) {
+    let data = generate_water_tile_rgba();
+    for py in 0u32..16 {
+        for px in 0u32..16 {
+            let idx = (py * 16 + px) as usize * 4;
+            let pixel = image::Rgba([data[idx], data[idx+1], data[idx+2], data[idx+3]]);
+            atlas.put_pixel(col * 16 + px, row * 16 + py, pixel);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct TileUV {

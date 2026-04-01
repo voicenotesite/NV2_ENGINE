@@ -113,7 +113,8 @@ pub struct State {
     pub input_captured: bool,
     pub last_ui_mode: UiMode,
     pub last_ui_selection: Option<usize>,
-    water_sim_dirty: bool,
+    /// `true` when the combined water GPU buffers need to be re-uploaded.
+    water_needs_gpu_upload: bool,
     /// Set when chunk meshes change; cleared after the next GPU buffer upload.
     needs_gpu_upload: bool,
     /// Accumulates dt; GPU buffer upload only runs when this exceeds 0.1 s.
@@ -502,7 +503,7 @@ impl State {
             input_captured: true,
             last_ui_mode: UiMode::None,
             last_ui_selection: None,
-            water_sim_dirty: false,
+            water_needs_gpu_upload: false,
             needs_gpu_upload: false,
             mesh_rebuild_timer: 0.0,
             cached_ui_vertex_buffer: None,
@@ -596,7 +597,7 @@ impl State {
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
         self.last_ui_mode = UiMode::None;
         self.last_ui_selection = None;
-        self.water_sim_dirty = false;
+        self.water_needs_gpu_upload = false;
         self.needs_gpu_upload = false;
         self.mesh_rebuild_timer = 0.0;
         self.cached_ui_vertex_buffer = None;
@@ -620,12 +621,24 @@ impl State {
         let biome_uniform = BiomeUniform { ambient };
         self.queue.write_buffer(&self.biome_buffer, 0, bytemuck::cast_slice(&[biome_uniform]));
 
-        // Water simulation throttled to 0.5 s to avoid constant mesh invalidation
+        // ── Water simulation — throttled to ~2 Hz ────────────────────────────
+        // simulate_water() now returns only the chunk coordinates that actually
+        // changed, so we can do a targeted mesh rebuild instead of flushing the
+        // entire water geometry every tick.
         self.water_sim_timer += dt;
         if self.water_sim_timer >= 0.5 {
             self.water_sim_timer = 0.0;
-            _world.simulate_water();
-            self.water_sim_dirty = true;
+            let dirty_water_chunks = _world.simulate_water();
+            for key in dirty_water_chunks {
+                // Only rebuild water mesh for this specific chunk
+                if _world.get_chunk(key.0, key.1).is_some() {
+                    let wmesh = mesh::ChunkMesh::build_water(_world, key.0, key.1);
+                    self.water_meshes.insert(key, wmesh);
+                } else {
+                    self.water_meshes.remove(&key);
+                }
+                self.water_needs_gpu_upload = true;
+            }
         }
 
         // Process any chunks that finished generating in background threads
@@ -650,6 +663,10 @@ impl State {
                         if _world.get_chunk(key.0, key.1).is_some() {
                             let m = mesh::ChunkMesh::build(_world, key.0, key.1);
                             self.chunk_meshes.insert(key, m);
+                            // Build water mesh for this new chunk too
+                            let wm = mesh::ChunkMesh::build_water(_world, key.0, key.1);
+                            self.water_meshes.insert(key, wm);
+                            self.water_needs_gpu_upload = true;
                         }
                     }
                 }
@@ -663,12 +680,25 @@ impl State {
             self.chunk_meshes.retain(|&(mx, mz), _| {
                 (mx - cx).abs() <= CLEANUP_RADIUS && (mz - cz).abs() <= CLEANUP_RADIUS
             });
+            // Evict water meshes outside cleanup radius and add any missing visible ones
+            self.water_meshes.retain(|&(mx, mz), _| {
+                (mx - cx).abs() <= CLEANUP_RADIUS && (mz - cz).abs() <= CLEANUP_RADIUS
+            });
+            for dz in -RENDER_RADIUS..=RENDER_RADIUS {
+                for dx in -RENDER_RADIUS..=RENDER_RADIUS {
+                    let key = (cx + dx, cz + dz);
+                    if !self.water_meshes.contains_key(&key) && _world.get_chunk(key.0, key.1).is_some() {
+                        let wm = mesh::ChunkMesh::build_water(_world, key.0, key.1);
+                        self.water_meshes.insert(key, wm);
+                    }
+                }
+            }
             self.needs_gpu_upload = true;
             self.mesh_rebuild_timer = 1.0; // bypasses the 0.1-s cooldown below
-            self.water_sim_dirty = true;
+            self.water_needs_gpu_upload = true;
         }
 
-        // ── Step 2: GPU buffer upload — debounced to ≤10 Hz ──────────────────
+        // ── Step 2: Opaque GPU buffer upload — debounced to ≤10 Hz ──────────
         // Multiple chunk arrivals within a 100ms window are batched into ONE upload,
         // eliminating the per-chunk GPU-alloc spikes that caused the FPS drops.
         self.mesh_rebuild_timer += dt;
@@ -706,17 +736,13 @@ impl State {
                 self.vertex_buffer = None;
                 self.index_buffer = None;
             }
-
-            self.water_sim_dirty = true;
         }
 
-        // ── Water mesh rebuild ──────────────────────────────────────────────
-        // Rebuild water geometry after simulation tick or when render extent changed.
-        if self.water_sim_dirty {
-            self.water_sim_dirty = false;
-
-            // Invalidate cached water meshes entirely so they are rebuilt fresh
-            self.water_meshes.clear();
+        // ── Step 3: Water GPU buffer upload — only when water mesh data changed ──
+        // We keep the water_meshes HashMap as a persistent cache.  Only chunks
+        // touched by the simulation or newly loaded trigger a GPU re-upload.
+        if self.water_needs_gpu_upload {
+            self.water_needs_gpu_upload = false;
 
             let mut water_vertices: Vec<Vertex> = Vec::new();
             let mut water_indices: Vec<u32> = Vec::new();
@@ -724,10 +750,6 @@ impl State {
             for dz in -RENDER_RADIUS..=RENDER_RADIUS {
                 for dx in -RENDER_RADIUS..=RENDER_RADIUS {
                     let key = (cx + dx, cz + dz);
-                    if _world.get_chunk(key.0, key.1).is_some() {
-                        let wmesh = mesh::ChunkMesh::build_water(_world, key.0, key.1);
-                        self.water_meshes.insert(key, wmesh);
-                    }
                     if let Some(wm) = self.water_meshes.get(&key) {
                         let base = water_vertices.len() as u32;
                         water_vertices.extend(&wm.vertices);
