@@ -270,11 +270,14 @@ impl World {
 
                         // ── Downward flow ─────────────────────────────────────────
                         if wy > 0 {
+                            // Chunk coordinate of the cell below (may differ when y==0)
+                            let below_cx = wx.div_euclid(CHUNK_W as i32);
+                            let below_cz = wz.div_euclid(CHUNK_D as i32);
                             match self.get_block(wx, wy - 1, wz) {
                                 BlockType::Air => {
                                     changes.push((wx, wy - 1, wz, BlockType::Water));
                                     meta_changes.push((wx, wy - 1, wz, 0x07)); // full level
-                                    dirty.insert(((wx).div_euclid(CHUNK_W as i32), (wz).div_euclid(CHUNK_D as i32)));
+                                    dirty.insert((below_cx, below_cz));
                                     if !is_source {
                                         changes.push((wx, wy, wz, BlockType::Air));
                                         meta_changes.push((wx, wy, wz, 0x00));
@@ -287,7 +290,7 @@ impl World {
                                     let below_meta = self.get_water_meta(wx, wy - 1, wz);
                                     if (below_meta & 0x08) == 0 && (below_meta & 0x07) < 7 {
                                         meta_changes.push((wx, wy - 1, wz, 0x07));
-                                        dirty.insert(((wx).div_euclid(CHUNK_W as i32), (wz).div_euclid(CHUNK_D as i32)));
+                                        dirty.insert((below_cx, below_cz));
                                     }
                                 }
                                 _ => {}

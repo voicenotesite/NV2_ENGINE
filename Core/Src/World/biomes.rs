@@ -338,9 +338,8 @@ impl BiomeGenerator {
 
         // Lake generation: fill terrain below sea level with standing water.
         // Applies to biomes that naturally have water bodies (not deserts, mountains, snow, beach).
-        const WATER_LEVEL: usize = 46;
-        if surface < WATER_LEVEL && !matches!(biome, Biome::Desert | Biome::Mountains | Biome::Snowy | Biome::Beach | Biome::River) {
-            for y in (surface + 1)..=WATER_LEVEL {
+        if surface < WATER_LEVEL as usize && Self::biome_allows_lakes(biome) {
+            for y in (surface + 1)..=(WATER_LEVEL as usize) {
                 if y < 256 {
                     column[y] = BlockType::Water;
                 }
@@ -362,13 +361,17 @@ impl BiomeGenerator {
             return true;
         }
         // Lake generation mirrors fill_column: terrain below WATER_LEVEL in
-        // non-desert / non-mountain / non-snowy / non-beach biomes is flooded.
+        // lake-eligible biomes is flooded.
         let h = self.surface_height(wx, wz);
-        h < WATER_LEVEL
-            && !matches!(
-                biome,
-                Biome::Desert | Biome::Mountains | Biome::Snowy | Biome::Beach | Biome::River
-            )
+        h < WATER_LEVEL && Self::biome_allows_lakes(biome)
+    }
+
+    /// Returns `true` for biomes where standing water (lakes) can naturally form.
+    fn biome_allows_lakes(biome: Biome) -> bool {
+        !matches!(
+            biome,
+            Biome::Desert | Biome::Mountains | Biome::Snowy | Biome::Beach | Biome::River
+        )
     }
 
     /// Ambient color and multiplier for lighting at given world position

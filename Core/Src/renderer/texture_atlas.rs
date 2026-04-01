@@ -258,9 +258,9 @@ impl AtlasTexture {
             }
             
             if !loaded {
-                // Water tiles: generate procedurally rather than showing a checkerboard
-                let is_water_tile = matches!(name, &"water_still" | &"water_flow");
-                if is_water_tile {
+                // Water textures: generate procedurally rather than showing a checkerboard
+                let is_water_texture = matches!(name, &"water_still" | &"water_flow");
+                if is_water_texture {
                     fill_water_tile(&mut atlas, *col as u32, *row as u32);
                     placed += 1;
                 } else {
